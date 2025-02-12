@@ -7,9 +7,11 @@ from langchain_huggingface import HuggingFaceEmbeddings
 import faiss
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
+from langchain_core.vectorstores.base import VectorStoreRetriever
 from uuid import uuid4
 from datasets import Dataset
 from langchain_ollama import ChatOllama
+import torch
 
 def get_embeddings(model_name):
     model_name = "dunzhang/stella_en_1.5B_v5"
@@ -41,7 +43,7 @@ def get_rag_chain(docs):
 
     vectorstore.add_documents(documents=docs, ids=uuids)
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
     #### RETRIEVAL and GENERATION ####
 
@@ -67,25 +69,62 @@ def get_rag_chain(docs):
         | StrOutputParser()
     )
 
-    return rag_chain, retriever, embeddings
+    return rag_chain, retriever, embeddings, llm
 
 
-def create_ragas_dataset(rag_chain, retriever, questions, ground_truths):
+async def create_ragas_dataset(rag_chain, retriever: VectorStoreRetriever, questions, ground_truths):
     answers = []
     contexts = []
 
-    for i, query in enumerate(questions):
-        if i > 4:
-            break
-        print(f"---DATASET CREATION: ANSWERING QUERY {i}/{len(questions)}")
-        answers.append(rag_chain.invoke(query))
-        contexts.append([docs.page_content for docs in retriever.invoke(query)])
+    import asyncio
+    semaphore = asyncio.Semaphore(3)
+
+    async def run_rag_queries():
+        async with semaphore:
+            results = await asyncio.gather(*(rag_chain.ainvoke(q) for q in questions))
+        return results
+    
+    task = asyncio.create_task(run_rag_queries())
+
+    answers = await task
+
+    print("Anwsers done")
+    
+    async def run_rag_queries():
+        async with semaphore:
+            results = await asyncio.gather(*(retriever.ainvoke(q) for q in questions))
+        return results
+    
+    task = asyncio.create_task(run_rag_queries())
+
+    contexts = await task
+
+    print("Context retrieved")
   
     data = {
-        "user_input": questions[:5],
+        "user_input": questions,
         "response": answers,
         "retrieved_contexts": contexts,
-        "reference": ground_truths[:5]
+        "reference": ground_truths
+    }
+    dataset = Dataset.from_dict(data)
+
+    return dataset
+
+def create_base_dataset(llm, questions, ground_truths):
+    answers = []
+    parser = StrOutputParser()
+    contexts = []
+    for i, query in enumerate(questions):
+        print(f"---DATASET CREATION: ANSWERING QUERY {i}/{len(questions)}")
+        answers.append(parser.parse(llm.invoke(query).content))
+        contexts.append([])
+  
+    data = {
+        "user_input": questions,
+        "response": answers,
+        "retrieved_contexts": contexts,
+        "reference": ground_truths
     }
     dataset = Dataset.from_dict(data)
 
